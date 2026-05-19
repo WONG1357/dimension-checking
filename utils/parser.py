@@ -16,6 +16,23 @@ DATE_RE = re.compile(
     r"(?P<year>20\d{2}|\d{2})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})"
 )
 TIME_LABEL_RE = re.compile(r"^(?:0|[01]?\d|2[0-3])(?::[0-5]\d){1,2}$")
+LABEL_PHRASES = [
+    "customerpartno",
+    "productpartname",
+    "machineno",
+    "mcpartno",
+    "sono",
+    "wono",
+    "lotno",
+    "date",
+    "客户产品编码",
+    "产品/配件名称",
+    "机台号",
+    "mc产品编号",
+    "工单号",
+    "批号",
+    "日期",
+]
 
 
 @dataclass
@@ -113,6 +130,39 @@ def normalize_search_text(value: Any) -> str:
     return text
 
 
+def is_valid_metadata_value(value: Any, field_name: str) -> bool:
+    value = normalize_cell_value(value)
+    if value is None:
+        return False
+    if isinstance(value, (datetime, date)):
+        return True
+    if not isinstance(value, str):
+        value = str(value)
+    text = value.strip()
+    if not text:
+        return False
+    lowered = normalize_search_text(text)
+    if any(phrase in lowered for phrase in LABEL_PHRASES):
+        return False
+    if field_name == "date":
+        return bool(_parse_date_value(value))
+    if field_name == "customer_part_no":
+        return bool(re.search(r"\d", text)) and not text.lower().startswith(("customer", "客户"))
+    if field_name == "product_part_name":
+        return not text.lower().startswith(("product", "产品"))
+    if field_name == "machine_no":
+        return bool(re.search(r"[a-z]", text, re.I)) and not text.lower().startswith(("machine", "机台"))
+    if field_name == "mc_part_no":
+        return bool(re.search(r"[a-z0-9]", text, re.I)) and not text.lower().startswith(("mc", "mc产品"))
+    if field_name == "so_no":
+        return bool(re.search(r"[a-z0-9]", text, re.I))
+    if field_name == "wo_no":
+        return bool(re.search(r"[a-z0-9]", text, re.I)) and not text.lower().startswith(("wo", "工单"))
+    if field_name == "lot_no":
+        return bool(re.search(r"\d", text)) and not text.lower().startswith(("lot", "批号"))
+    return True
+
+
 def resolve_cell_value(ws, row: int, col: int, merged_map: dict[tuple[int, int], Any]) -> Any:
     value = ws.cell(row=row, column=col).value
     if value is not None:
@@ -186,30 +236,65 @@ def _row_contains_any(values: list[Any], needles: Iterable[str]) -> bool:
     return any(needle in text for needle in needles)
 
 
+def _cell_contains_any(value: Any, needles: Iterable[str]) -> bool:
+    text = normalize_search_text(value)
+    return any(needle in text for needle in needles)
+
+
 def _find_first_meaningful_rightward(
     ws,
     row: int,
     col: int,
     merged_map: dict[tuple[int, int], Any],
     max_cols: int = 10,
+    field_name: str | None = None,
 ) -> Any:
     for offset in range(1, max_cols + 1):
         value = resolve_cell_value(ws, row, col + offset, merged_map)
         if value is None:
             continue
-        if normalize_search_text(value) in {
-            "customerpartno",
-            "productpartname",
-            "materialpartnoname",
-            "machineno",
-            "mcpartno",
-            "sono",
-            "wono",
-            "lotno",
-            "date",
-        }:
+        if field_name is not None and not is_valid_metadata_value(value, field_name):
             continue
         return value
+    return None
+
+
+def _search_metadata_candidate(
+    ws,
+    label_row: int,
+    label_col: int,
+    merged_map: dict[tuple[int, int], Any],
+    field_name: str,
+) -> Any:
+    for row_idx in range(label_row, min(ws.max_row, label_row + 3) + 1):
+        for col_idx in range(label_col + 1, min(ws.max_column, label_col + 12) + 1):
+            value = resolve_cell_value(ws, row_idx, col_idx, merged_map)
+            if is_valid_metadata_value(value, field_name):
+                return value
+    return None
+
+
+def _parse_date_from_context(ws, label_row: int, label_col: int, merged_map: dict[tuple[int, int], Any]) -> str | None:
+    numbers: list[int] = []
+    for row_idx in range(label_row, min(ws.max_row, label_row + 3) + 1):
+        for col_idx in range(label_col, min(ws.max_column, label_col + 12) + 1):
+            value = resolve_cell_value(ws, row_idx, col_idx, merged_map)
+            if isinstance(value, datetime):
+                return value.strftime("%Y-%m-%d")
+            if isinstance(value, date):
+                return value.strftime("%Y-%m-%d")
+            if isinstance(value, (int, float)) and float(value).is_integer():
+                numbers.append(int(value))
+            elif isinstance(value, str):
+                parsed = _parse_date_value(value)
+                if parsed:
+                    return parsed
+    if len(numbers) >= 3:
+        year, month, day = numbers[:3]
+        if year < 100:
+            year += 2000
+        if 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:04d}-{month:02d}-{day:02d}"
     return None
 
 
@@ -228,14 +313,14 @@ def extract_header_info(ws) -> dict[str, Any]:
         "lot_no": None,
     }
     labels = {
-        "customer_part_no": ["customerpartno"],
-        "product_part_name": ["productpartname"],
+        "customer_part_no": ["customerpartno", "客户产品编码"],
+        "product_part_name": ["productpartname", "产品/配件名称"],
         "material_part_no_name": ["materialpartnoname", "colourpigmentcolorantbatchpartnoname"],
-        "machine_no": ["machineno"],
-        "mc_part_no": ["mcpartno"],
-        "so_no": ["sono"],
-        "wo_no": ["wono"],
-        "lot_no": ["lotno"],
+        "machine_no": ["machineno", "机台号"],
+        "mc_part_no": ["mcpartno", "mc产品编号"],
+        "so_no": ["sono", "销售单号"],
+        "wo_no": ["wono", "工单号"],
+        "lot_no": ["lotno", "批号"],
     }
 
     for row in ws.iter_rows():
@@ -246,24 +331,27 @@ def extract_header_info(ws) -> dict[str, Any]:
             text = normalize_search_text(value)
             if not text:
                 continue
-            if headers["date"] is None:
-                parsed_date = _parse_date_value(value)
+            if headers["date"] is None and ("date" in text or "日期" in str(value)):
+                parsed_date = _parse_date_from_context(ws, cell.row, cell.column, merged_map)
                 if parsed_date:
                     headers["date"] = parsed_date
             for key, needle_list in labels.items():
                 if headers[key] is not None:
                     continue
                 if any(needle in text for needle in needle_list):
-                    candidate = _find_first_meaningful_rightward(ws, cell.row, cell.column, merged_map)
+                    candidate = _search_metadata_candidate(ws, cell.row, cell.column, merged_map, key)
                     if candidate is None and cell.row + 1 <= ws.max_row:
-                        candidate = _find_first_meaningful_rightward(ws, cell.row + 1, cell.column, merged_map)
+                        candidate = _search_metadata_candidate(ws, cell.row + 1, cell.column, merged_map, key)
+                    if candidate is None and cell.row + 2 <= ws.max_row:
+                        candidate = _search_metadata_candidate(ws, cell.row + 2, cell.column, merged_map, key)
                     if candidate is not None:
                         headers[key] = normalize_cell_value(candidate)
 
     if headers["date"] is None:
         for row in ws.iter_rows():
             for cell in row:
-                parsed_date = _parse_date_value(resolve_cell_value(ws, cell.row, cell.column, merged_map))
+                candidate = resolve_cell_value(ws, cell.row, cell.column, merged_map)
+                parsed_date = _parse_date_value(candidate)
                 if parsed_date:
                     headers["date"] = parsed_date
                     break
